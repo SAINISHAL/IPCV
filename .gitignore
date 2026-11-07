@@ -1,0 +1,39 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Environment
+.env
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large models/caches
+*.pt.cache
+
+# Local datasets, enrollment images, and generated artifacts
+/data/
+/models/
+/reports/
+/tmp_test_dir/
+*.zip
+*.pt
+*.onnx
+*.pkl
+.env.*
+

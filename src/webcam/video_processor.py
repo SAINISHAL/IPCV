@@ -1,0 +1,236 @@
+"""Unified Video and Image Processor with Visual Label Overlay and Temporal Smoothing."""
+from typing import List, Tuple, Dict, Any, Optional
+from collections import defaultdict, deque
+import cv2
+import numpy as np
+
+from src.recognition.prediction import RecognitionPipeline
+from src.utils.logger import setup_logger
+
+logger = setup_logger("VideoProcessor")
+
+
+class TemporalPredictionSmoother:
+    """Stabilizes identity predictions across consecutive video frames to prevent label flickering."""
+
+    def __init__(self, window_size: int = 5, iou_match_threshold: float = 0.35):
+        self.window_size = window_size
+        self.iou_match_threshold = iou_match_threshold
+        self.track_history = defaultdict(lambda: deque(maxlen=self.window_size))
+        self.track_boxes = {}
+        self.next_track_id = 0
+
+    @staticmethod
+    def compute_iou(boxA: Tuple[int, int, int, int], boxB: Tuple[int, int, int, int]) -> float:
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[2], boxB[2])
+        yB = min(boxA[3], boxB[3])
+
+        interArea = max(0, xB - xA) * max(0, yB - yA)
+        boxAArea = max(1, (boxA[2] - boxA[0]) * (boxA[3] - boxA[1]))
+        boxBArea = max(1, (boxB[2] - boxB[0]) * (boxB[3] - boxB[1]))
+
+        return interArea / float(boxAArea + boxBArea - interArea)
+
+    def smooth(self, detected_faces: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        new_track_boxes = {}
+        smoothed_results = []
+
+        for face in detected_faces:
+            box = face["box"]
+            raw_id = face["identity"]
+
+            best_iou = 0.0
+            best_tid = None
+            for tid, prev_box in self.track_boxes.items():
+                if tid in new_track_boxes:
+                    continue
+                iou = self.compute_iou(box, prev_box)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_tid = tid
+
+            if best_tid is not None and best_iou >= self.iou_match_threshold:
+                track_id = best_tid
+            else:
+                track_id = self.next_track_id
+                self.next_track_id += 1
+
+            self.track_history[track_id].append(raw_id)
+            new_track_boxes[track_id] = box
+
+            smoothed_face = dict(face)
+            history = self.track_history[track_id]
+            if history.count(raw_id) * 2 <= len(history):
+                smoothed_face["identity"] = "UNKNOWN"
+            smoothed_face["track_id"] = track_id
+            smoothed_results.append(smoothed_face)
+
+        self.track_boxes = new_track_boxes
+        for track_id in self.track_history.keys() - new_track_boxes.keys():
+            del self.track_history[track_id]
+        return smoothed_results
+
+
+class VideoProcessor:
+    """Processes webcam frames and uploaded images, runs detection + Eigenfaces recognition, and renders labels."""
+
+    def __init__(self, detector: Any,
+                 recognition_pipeline: RecognitionPipeline,
+                 enable_smoothing: bool = True,
+                 smoothing_window: int = 5):
+        self.detector = detector
+        self.pipeline = recognition_pipeline
+        self.smoother = TemporalPredictionSmoother(window_size=smoothing_window) if enable_smoothing else None
+        
+        self.frame_count = 0
+        self.start_time = None
+        self.fps = 0.0
+
+    def draw_face_annotations(self, image: np.ndarray, faces: List[Dict[str, Any]]) -> np.ndarray:
+        """Draw high-contrast, professional visual bounding boxes and name labels directly on image."""
+        annotated = image.copy()
+        img_h, img_w = annotated.shape[:2]
+
+        for f in faces:
+            x1, y1, x2, y2 = f["box"]
+            identity = f["identity"]
+            rec_conf = f.get("rec_conf")
+            dist = f.get("distance")
+
+            is_unknown = (identity == "UNKNOWN")
+            
+            # Colors: Vibrant Green for enrolled students, Red for UNKNOWN
+            box_color = (0, 0, 240) if is_unknown else (0, 200, 0)
+            badge_color = (0, 0, 180) if is_unknown else (0, 150, 0)
+
+            # Draw outer rectangle
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2, cv2.LINE_AA)
+
+            # Build label caption
+            if is_unknown:
+                caption = "MOVE INTO FRAME" if f.get("at_frame_edge") else "UNKNOWN"
+            else:
+                if rec_conf is not None:
+                    caption = f"{identity} ({rec_conf:.2f})"
+                elif dist is not None:
+                    caption = f"{identity} [d={dist:.1f}]"
+                else:
+                    caption = identity
+
+            # Calculate text size
+            font = cv2.FONT_HERSHEY_DUPLEX
+            font_scale = max(0.45, min(0.75, (y2 - y1) / 160.0))
+            thickness = 1
+            (tw, th), baseline = cv2.getTextSize(caption, font, font_scale, thickness)
+
+            # Position badge above bounding box (or below if too close to top)
+            if y1 - th - 10 > 5:
+                badge_y1 = y1 - th - 10
+                badge_y2 = y1
+                text_y = y1 - 5
+            elif y2 + th + 10 < img_h:
+                badge_y1 = y2
+                badge_y2 = y2 + th + 10
+                text_y = y2 + th + 5
+            else:
+                badge_y1 = y1
+                badge_y2 = y1 + th + 10
+                text_y = y1 + th + 5
+
+            badge_x1 = max(0, min(x1, img_w - tw - 10))
+            badge_x2 = min(img_w, badge_x1 + tw + 10)
+
+            # Background solid badge for 100% readability
+            cv2.rectangle(annotated, (badge_x1, badge_y1), (badge_x2, badge_y2), badge_color, -1)
+            # Outline around badge
+            cv2.rectangle(annotated, (badge_x1, badge_y1), (badge_x2, badge_y2), box_color, 1, cv2.LINE_AA)
+            # Bold white text
+            cv2.putText(annotated, caption, (badge_x1 + 5, text_y), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+        return annotated
+
+    def process_frame(self, frame: np.ndarray, is_video_stream: bool = True) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """Process a single camera frame or uploaded photograph consistently.
+        
+        Returns:
+            Tuple of (annotated_image_with_labels, metadata_dict).
+        """
+        if frame is None or frame.size == 0:
+            return frame, {"detected": 0, "recognized": 0, "unknown": 0, "fps": 0.0, "faces": []}
+
+        # 1. Detect faces using Unified Detector
+        alignment = self.pipeline.eigenfaces_model.face_alignment
+        if alignment == "sface":
+            detections = self.detector.detect_faces(frame, alignment=alignment)
+        else:
+            detections = self.detector.detect_faces(frame)
+        faces_recognized = []
+
+        # 2. Recognize each detected face crop using Eigenfaces
+        frame_h, frame_w = frame.shape[:2]
+        for det in detections:
+            x1, y1, x2, y2 = det["box"]
+            left, top, right, bottom = det.get("raw_box", det["box"])
+            at_frame_edge = left <= 2 or top <= 2 or right >= frame_w - 2 or bottom >= frame_h - 2
+            
+            aligned_crop = det.get("aligned_crop")
+            crop = aligned_crop if aligned_crop is not None else frame[y1:y2, x1:x2]
+            rec_res = {"identity": "UNKNOWN", "confidence": 0.0}
+            can_classify = aligned_crop is not None or alignment != "sface"
+            if can_classify and min(crop.shape[:2]) >= 15:
+                try:
+                    rec_res = self.pipeline.recognize_face(crop)
+                except Exception as e:
+                    logger.error(f"Recognition pipeline error on face crop: {e}")
+
+            faces_recognized.append({
+                "box": (x1, y1, x2, y2),
+                "det_conf": det["confidence"],
+                "identity": rec_res["identity"],
+                "rec_conf": rec_res["confidence"],
+                "distance": rec_res.get("distance"),
+                "crop": crop,
+                "at_frame_edge": at_frame_edge,
+                "source": det.get("source", "detector")
+            })
+
+        # 3. Apply smoothing ONLY for continuous video streams
+        if is_video_stream and self.smoother is not None:
+            faces_recognized = self.smoother.smooth(faces_recognized)
+
+        # 4. Draw bounding boxes and labels directly on faces
+        annotated = self.draw_face_annotations(frame, faces_recognized)
+
+        # 5. Compute stats
+        n_detected = len(detections)
+        n_unknown = sum(1 for f in faces_recognized if f["identity"] == "UNKNOWN")
+        predicted_names = [f["identity"] for f in faces_recognized if f["identity"] != "UNKNOWN"]
+        n_recognized = len(predicted_names)
+
+        # FPS calculation for live video
+        if is_video_stream:
+            self.frame_count += 1
+            if self.start_time is None:
+                self.start_time = cv2.getTickCount()
+            else:
+                elapsed = (cv2.getTickCount() - self.start_time) / cv2.getTickFrequency()
+                if elapsed > 0.5:
+                    self.fps = float(self.frame_count / elapsed)
+                    self.frame_count = 0
+                    self.start_time = cv2.getTickCount()
+
+            hud_text = f"FPS: {self.fps:.1f} | Detected: {n_detected} | Known: {n_recognized} | Unknown: {n_unknown}"
+            cv2.putText(annotated, hud_text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(annotated, hud_text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+
+        meta = {
+            "detected": n_detected,
+            "recognized": n_recognized,
+            "unknown": n_unknown,
+            "predicted_names": predicted_names,
+            "fps": self.fps if is_video_stream else None,
+            "faces": faces_recognized
+        }
+        return annotated, meta
