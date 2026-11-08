@@ -1,6 +1,10 @@
 """Interactive Streamlit Presentation Dashboard for Classroom Face Recognition."""
 import sys
+from base64 import b64encode
+from html import escape
 from pathlib import Path
+from threading import Lock
+from uuid import uuid4
 import json
 import time
 import cv2
@@ -23,6 +27,8 @@ from src.recognition.svm_classifier import SVMClassifier
 from src.recognition.knn_classifier import KNNClassifier
 from src.recognition.euclidean_classifier import EuclideanClassifier
 from src.webcam.video_processor import VideoProcessor
+from src.webcam.live_camera import LiveCamera
+from src.webcam.enrollment import CAPTURE_PROMPTS, save_capture
 
 # Set page config
 st.set_page_config(
@@ -56,6 +62,15 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+def create_detector(config):
+    return UnifiedFaceDetector(
+        engine=config["detection"].get("engine", "ensemble"),
+        conf_thresh=config["detection"].get("confidence_threshold", 0.35),
+        nms_thresh=config["detection"].get("nms_threshold", 0.40),
+        align_faces=True,
+    )
+
+
 @st.cache_resource
 def get_system_components():
     """Load configuration, models, and detection pipelines."""
@@ -63,7 +78,7 @@ def get_system_components():
     target_size = tuple(config["preprocessing"]["target_size"])
     label_path = PROJECT_ROOT / config["paths"]["label_file"]
 
-    identity_mapper = IdentityMapper(label_path)
+    identity_mapper = IdentityMapper(label_path if label_path.is_file() else None)
 
     # Models
     pca_path = PROJECT_ROOT / config["paths"]["pca_model_dir"] / "pca_model.pkl"
@@ -94,22 +109,162 @@ def get_system_components():
         classifiers["euclidean"] = euc
 
     # Unified Face Detector (YOLOv8-Face + YuNet Ensemble)
-    yunet_path = PROJECT_ROOT / "models" / "pretrained" / "yunet.onnx"
-    yolo_face_path = PROJECT_ROOT / "models" / "yolo" / "yolov8n-face.pt"
-    detector = UnifiedFaceDetector(
-        engine=config["detection"].get("engine", "ensemble"),
-        yolo_face_path=yolo_face_path,
-        yunet_model_path=yunet_path,
-        conf_thresh=config["detection"].get("confidence_threshold", 0.35),
-        align_faces=True
-    )
+    detector = create_detector(config)
 
-    preprocessor = ImagePreprocessor(target_size=target_size, enable_clahe=True)
+    preprocessor = ImagePreprocessor.for_model(pca_model) if pca_model else ImagePreprocessor(target_size=target_size)
 
     return config, identity_mapper, pca_model, classifiers, detector, preprocessor
 
 
 config, identity_mapper, pca_model, classifiers, detector, preprocessor = get_system_components()
+
+
+@st.cache_resource
+def get_live_detector():
+    # Keep live inference separate from mutable settings on the upload/debug pages.
+    live_detector = create_detector(config)
+    if live_detector.yolo_face is None and live_detector.yunet_detector is None:
+        raise RuntimeError("The pretrained face detector files are missing from the models folder.")
+    return live_detector, Lock()
+
+
+@st.cache_resource
+def get_live_inference():
+    live_detector, lock = get_live_detector()
+    if pca_model.face_alignment == "sface":
+        if live_detector.yunet_detector is None or not (PROJECT_ROOT / "models/pretrained/sface.onnx").is_file():
+            raise RuntimeError("Live recognition requires the local YuNet and SFace model files for face alignment.")
+    live_pipeline = RecognitionPipeline(
+        preprocessor=ImagePreprocessor.for_model(pca_model),
+        eigenfaces_model=pca_model,
+        classifier_type="svm",
+    )
+    live_pipeline.set_classifier(classifiers["svm"], "svm")
+    return live_detector, live_pipeline, lock
+
+
+def render_live_camera():
+    camera = st.session_state.get("live_camera")
+    active = camera is not None and camera.active
+    device_id = st.number_input("Camera device", min_value=0, step=1,
+                                value=config["webcam"]["device_id"], disabled=active,
+                                help="0 is usually the built-in camera. Try 1 or higher for a USB camera.")
+    mode = st.selectbox("Detection mode", ["Fast (YuNet)", "Full ensemble (YOLOv8-Face + YuNet)"],
+                        disabled=active, help="Use the full ensemble when some faces are small or far away.")
+    diagnostics = st.checkbox("Print per-face diagnostics to the local console", disabled=active)
+    engine = "yunet" if mode == "Fast (YuNet)" else "ensemble"
+    start, stop = st.columns(2)
+    if start.button("Start Camera", type="primary", disabled=active):
+        try:
+            live_detector, live_pipeline, inference_lock = get_live_inference()
+            processor = VideoProcessor(live_detector, live_pipeline,
+                                       smoothing_window=config["webcam"].get("smoothing_window_size", 5),
+                                       diagnostics=diagnostics)
+
+            def process(frame):
+                with inference_lock:
+                    live_detector.engine = engine
+                    return processor.process_frame(frame, is_video_stream=True)
+
+            camera = LiveCamera(int(device_id), config["webcam"], process)
+            st.session_state.live_camera = camera
+            st.rerun()
+        except RuntimeError as exc:
+            st.error(str(exc))
+    if stop.button("Stop Camera", disabled=not active):
+        camera.stop()
+        st.rerun()
+
+    if camera is None:
+        st.caption("Camera stopped. Select a device and press Start Camera.")
+        return
+
+    st.fragment(run_every=0.16 if active else None)(render_live_frame)(camera, active)
+
+
+def render_live_frame(camera, polling):
+    status, frame = camera.snapshot()
+    if polling and not camera.active:
+        st.rerun()  # Re-enable controls and stop polling after the worker releases the device.
+    if frame is None:
+        if camera.active or status == "Camera stopped.":
+            st.caption(status)
+        else:
+            st.error(status)
+        return
+
+    fps = f"{frame.fps:.1f}" if frame.fps is not None else "–"
+    face_rows = "".join(
+        f"<li>Face {track_id + 1}: {escape(identity)} "
+        f"({ 'Unknown' if identity == 'UNKNOWN' else 'Recognized' })</li>"
+        for track_id, identity in frame.faces
+    )
+    face_status = f"<ul>{face_rows}</ul>" if face_rows else "<p>No faces detected in the current frame.</p>"
+    # Publish one display update so a new frame cannot invalidate an image URL still being fetched.
+    image = b64encode(frame.jpeg).decode("ascii")
+    st.html(f"""
+        <div>
+          <p><strong>{escape(status)}</strong> · Camera {camera.device_id}
+             · Saved SVM cutoff {classifiers['svm'].confidence_threshold:.3f}</p>
+          <p><strong>Faces detected:</strong> {frame.detected} · <strong>Recognized:</strong> {frame.recognized}
+             · <strong>Unknown:</strong> {frame.unknown} · <strong>Processed FPS:</strong> {fps}</p>
+          <img src="data:image/jpeg;base64,{image}" alt="Live webcam feed with face labels"
+               style="display:block;width:100%;border-radius:0.5rem;margin-bottom:0.75rem">
+          {face_status}
+        </div>
+    """)
+
+
+def render_enrollment_capture():
+    st.header("Guided Webcam Capture")
+    st.caption("Save one consenting person per photo. Keep phones and other faces out of the frame.")
+    session = st.session_state.get("enrollment_session")
+    if session is None:
+        mapping = PROJECT_ROOT / "data" / "identity_mapping.json"
+        names = sorted({name for name in json.loads(mapping.read_text(encoding="utf-8")).values()
+                        if name and name not in {"UNKNOWN", "(Unassigned)", "REMOVE / FALSE DETECTION"}}) if mapping.is_file() else []
+        purpose = st.radio("Capture set", ["Training", "Final test", "Unenrolled final test"])
+        split = {"Training": "train", "Final test": "test", "Unenrolled final test": "unknown"}[purpose]
+        if not names and split != "unknown":
+            st.error("Set up the local identity mapping before collecting student photos.")
+            return
+        name = st.selectbox("Confirmed identity", names) if split != "unknown" else "Unenrolled"
+        st.info("Take the final-test photos in a separate session. They are excluded from training and tuning.")
+        if st.button("Begin capture session", type="primary"):
+            st.session_state.enrollment_session = {"id": uuid4().hex, "split": split, "name": name, "count": 0}
+            st.rerun()
+        return
+
+    count = session["count"]
+    st.write(f"**{session['name']}** · {session['split'].title()} · {count} independent captures saved")
+    st.write(CAPTURE_PROMPTS[count % len(CAPTURE_PROMPTS)])
+    st.caption("Aim for 20–40 varied training photos if feasible. Capture fresh photos in a separate final-test session.")
+    if st.button("Finish capture session"):
+        del st.session_state.enrollment_session
+        st.rerun()
+
+    key = f"{session['id']}_{count}"
+    shot = st.camera_input("Take this capture", key=f"capture_{key}")
+    if shot is None:
+        return
+    subject = ("a person who is not enrolled" if session["split"] == "unknown" else session["name"])
+    confirmed = st.checkbox(f"I confirm this photo shows {subject} and they consent to this use.", key=f"confirm_{key}")
+    if st.button("Save confirmed photo", disabled=not confirmed) and confirmed:
+        frame = cv2.imdecode(np.frombuffer(shot.getvalue(), dtype=np.uint8), cv2.IMREAD_COLOR)
+        try:
+            live_detector, lock = get_live_detector()
+            if live_detector.yunet_detector is None or not (PROJECT_ROOT / "models/pretrained/sface.onnx").is_file():
+                raise RuntimeError("Guided capture requires local YuNet and SFace models for alignment.")
+            with lock:
+                live_detector.engine = "yunet"
+                save_capture(PROJECT_ROOT / "data" / "enrollment_sessions", session["split"],
+                             session["name"], session["id"], count + 1, frame, live_detector)
+        except (ValueError, RuntimeError, OSError) as exc:
+            st.error(str(exc))
+        else:
+            session["count"] += 1
+            st.rerun()
+
 
 # Sidebar Navigation
 st.sidebar.title("Navigation")
@@ -122,8 +277,12 @@ page = st.sidebar.radio(
      "5. Cluster Review & Identity Mapping",
      "6. Dataset & Image Access Audit",
      "7. Eigenfaces Visualization",
-     "8. Model Evaluation & Benchmark"]
+     "8. Model Evaluation & Benchmark",
+     "9. Guided Webcam Capture"]
 )
+
+if page != "4. Live Webcam Recognition" and st.session_state.get("live_camera") is not None:
+    st.session_state.live_camera.stop()
 
 st.sidebar.markdown("---")
 st.sidebar.info(
@@ -382,34 +541,11 @@ elif page == "4. Live Webcam Recognition":
     st.markdown('<div class="main-header">📹 Live Webcam Face Recognition</div>', unsafe_allow_html=True)
     st.markdown('<div class="sub-header">Continuous real-time multi-face detection with predictions displayed directly above faces.</div>', unsafe_allow_html=True)
 
-    selected_clf = st.selectbox("Select Classification Engine for Webcam:", ["SVM", "Euclidean", "KNN"], index=0, key="cam_clf")
-    clf_obj = classifiers.get(selected_clf.lower())
-
-    pipeline = RecognitionPipeline(
-        preprocessor=preprocessor,
-        eigenfaces_model=pca_model,
-        classifier_type=selected_clf.lower(),
-        k_components=pca_model.n_components
-    )
-    pipeline.set_classifier(clf_obj, selected_clf.lower())
-    processor = VideoProcessor(detector=detector, recognition_pipeline=pipeline, enable_smoothing=True)
-
-    st.info("💡 For optimal 30+ FPS low-latency performance on your laptop camera, launch the native OpenCV camera window:")
-    if st.button("🚀 Launch Native OpenCV Live Webcam Window"):
-        from src.webcam.webcam_recognition import WebcamRecognitionApp
-        app = WebcamRecognitionApp()
-        app.initialize_models()
-        app.run(device_id=0)
-
-    st.markdown("---")
-    st.markdown("#### Or test using browser camera snapshot:")
-    camera_img = st.camera_input("Take a snapshot with your webcam")
-    if camera_img is not None:
-        file_bytes = np.asarray(bytearray(camera_img.read()), dtype=np.uint8)
-        img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        annotated, meta = processor.process_frame(img, is_video_stream=False)
-        rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-        st.image(rgb, caption=f"Webcam Result: {meta['detected']} face(s) found", use_container_width=True)
+    if pca_model is None or "svm" not in classifiers:
+        st.error("The saved PCA and SVM model files are required to start live recognition.")
+    else:
+        st.caption("Uses the webcam connected to the computer running this dashboard.")
+        render_live_camera()
 
 # -----------------------------------------------------------------------------
 # PAGE 5: CLUSTER REVIEW & IDENTITY MAPPING
@@ -472,7 +608,9 @@ elif page == "8. Model Evaluation & Benchmark":
     tab_recog, tab_detect = st.tabs(["Face Recognition Benchmark", "Face Detection Benchmark (NEW)"])
 
     with tab_recog:
-        eval_md = PROJECT_ROOT / "reports" / "model_evaluation_report.md"
+        studies = (PROJECT_ROOT / "reports" / "recognition_study").rglob("report.md")
+        eval_md = max(studies, key=lambda p: p.stat().st_mtime,
+                      default=PROJECT_ROOT / "reports" / "model_evaluation_report.md")
         if eval_md.exists():
             with open(eval_md, "r", encoding="utf-8") as f:
                 st.markdown(f.read())
@@ -491,3 +629,6 @@ elif page == "8. Model Evaluation & Benchmark":
         if det_md.exists():
             with open(det_md, "r", encoding="utf-8") as f:
                 st.markdown(f.read())
+
+elif page == "9. Guided Webcam Capture":
+    render_enrollment_capture()

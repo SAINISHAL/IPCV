@@ -19,14 +19,23 @@ class ImagePreprocessor:
                  clahe_clip_limit: float = 2.0,
                  clahe_grid_size: Tuple[int, int] = (8, 8),
                  enable_alignment: bool = False,
-                 normalize_intensity: bool = True):
+                 normalize_intensity: bool = True,
+                 contrast_mode: Optional[str] = None):
         self.target_size = target_size
         self.enable_clahe = enable_clahe
         self.enable_alignment = enable_alignment
         self.normalize_intensity = normalize_intensity
+        self.contrast_mode = contrast_mode or ("clahe" if enable_clahe else "equalize")
+        if self.contrast_mode not in {"gray", "clahe", "gamma", "clahe_gamma", "equalize"}:
+            raise ValueError(f"Unknown contrast mode: {self.contrast_mode}")
+        self.gamma_lut = np.round(255 * (np.arange(256) / 255) ** 0.80).astype(np.uint8)
         
         self.clahe = cv2.createCLAHE(clipLimit=clahe_clip_limit, tileGridSize=clahe_grid_size)
         self.aligner = FaceAligner() if enable_alignment else None
+
+    @classmethod
+    def for_model(cls, model) -> "ImagePreprocessor":
+        return cls(target_size=model.target_shape, contrast_mode=model.preprocessing_mode)
 
     def process(self, image: np.ndarray) -> np.ndarray:
         """Process a single raw face crop.
@@ -61,10 +70,13 @@ class ImagePreprocessor:
         resized = cv2.resize(gray, (target_w, target_h), interpolation=interp)
 
         # 4. CLAHE
-        if self.enable_clahe:
-            equalized = self.clahe.apply(resized)
-        else:
-            equalized = cv2.equalizeHist(resized)
+        equalized = resized
+        if self.contrast_mode in {"clahe", "clahe_gamma"}:
+            equalized = self.clahe.apply(equalized)
+        elif self.contrast_mode == "equalize":
+            equalized = cv2.equalizeHist(equalized)
+        if self.contrast_mode in {"gamma", "clahe_gamma"}:
+            equalized = cv2.LUT(equalized, self.gamma_lut)
 
         # 5. Normalization
         if self.normalize_intensity:

@@ -15,10 +15,13 @@ class EigenfacesModel:
     """High-level Eigenfaces representation model."""
 
     def __init__(self, target_shape: Tuple[int, int] = (100, 100), n_components: Optional[int] = 25,
-                 face_alignment: str = "eyes"):
+                 face_alignment: str = "eyes", preprocessing_mode: str = "clahe",
+                 webcam_retry: bool = True):
         self.target_shape = target_shape  # (width, height)
         self.n_components = n_components
         self.face_alignment = face_alignment
+        self.preprocessing_mode = preprocessing_mode
+        self.webcam_retry = webcam_retry
         self.pca = PCAFromScratch(n_components=n_components)
         self.is_trained = False
 
@@ -51,6 +54,8 @@ class EigenfacesModel:
             "target_shape": self.target_shape,
             "n_components": self.n_components,
             "face_alignment": self.face_alignment,
+            "preprocessing_mode": self.preprocessing_mode,
+            "webcam_retry": self.webcam_retry,
             "mean_vector": self.pca.mean_vector,
             "eigenvalues": self.pca.eigenvalues,
             "eigenvectors": self.pca.eigenvectors,
@@ -74,6 +79,8 @@ class EigenfacesModel:
         self.target_shape = data["target_shape"]
         self.n_components = data["n_components"]
         self.face_alignment = data.get("face_alignment", "eyes")
+        self.preprocessing_mode = data.get("preprocessing_mode", "clahe")
+        self.webcam_retry = data.get("webcam_retry", True)
         self.pca.n_components = self.n_components
         self.pca.mean_vector = data["mean_vector"]
         self.pca.eigenvalues = data["eigenvalues"]

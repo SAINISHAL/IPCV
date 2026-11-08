@@ -13,6 +13,7 @@ from src.recognition.svm_classifier import SVMClassifier
 from src.recognition.knn_classifier import KNNClassifier
 from src.recognition.euclidean_classifier import EuclideanClassifier
 from src.webcam.video_processor import VideoProcessor
+from src.webcam.live_camera import open_webcam
 
 logger = setup_logger("WebcamRecognition")
 
@@ -43,7 +44,6 @@ class WebcamRecognitionApp:
 
         # 2. Preprocessor (100x100 CLAHE)
         target_size = tuple(self.config["preprocessing"]["target_size"])
-        preprocessor = ImagePreprocessor(target_size=target_size, enable_clahe=True)
 
         # 3. PCA Model
         pca_path = self.root / self.config["paths"]["pca_model_dir"] / "pca_model.pkl"
@@ -51,6 +51,7 @@ class WebcamRecognitionApp:
         if not pca_path.exists():
             raise FileNotFoundError(f"PCA model not found at: {pca_path}. Please run train.py first.")
         eigenfaces_model.load(pca_path)
+        preprocessor = ImagePreprocessor.for_model(eigenfaces_model)
 
         # 4. Classifier
         clf_type = self.config["recognition"]["classifier_type"].lower()
@@ -99,17 +100,16 @@ class WebcamRecognitionApp:
         else:
             dev = device_id if device_id is not None else self.config["webcam"]["device_id"]
             logger.info(f"Opening camera device ID: {dev}...")
-            self.cap = cv2.VideoCapture(dev, cv2.CAP_DSHOW)
-            if not self.cap.isOpened():
-                self.cap = cv2.VideoCapture(dev)
+            try:
+                self.cap = open_webcam(dev, self.config["webcam"])
+            except RuntimeError as exc:
+                logger.error(str(exc))
+                return
 
         if not self.cap.isOpened():
             logger.error(f"Failed to open video source (device {device_id} or file {video_source}).")
-            print("\n[ERROR] Camera device could not be opened. Check connection or try another device ID.")
+            self.cap.release()
             return
-
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config["webcam"]["frame_width"])
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config["webcam"]["frame_height"])
 
         window_name = "Classroom Face Recognition (Press 'q' or 'ESC' to exit)"
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)

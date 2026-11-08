@@ -170,8 +170,39 @@ python scripts/run_webcam.py --device 1
 
 ### D. Interactive Streamlit Web Dashboard
 ```powershell
-streamlit run app/app.py
+python -m streamlit run app/app.py
 ```
+
+Open **Live Webcam Recognition**, select the camera device, and press **Start
+Camera**. Device `0` is typically the built-in webcam and additional devices
+can use `1`, `2`, and higher indices. The dashboard uses the camera connected to
+the computer running Streamlit. It displays the live feed, per-face recognition
+status, and the measured rate of processed frames. Press **Stop Camera** or leave
+the page to release the webcam. If the device fails to open, check system camera
+permissions and close other apps using it. Use **Uploaded Image Recognition**
+for saved photos.
+
+The live feed defaults to the pretrained YuNet detector for faster processing.
+Choose **Full ensemble** before starting if you need the extra YOLOv8-Face pass
+for small or distant faces. Both modes use the same saved PCA and SVM model.
+
+### Guided capture and recognition study
+
+Open **Guided Webcam Capture** to save confirmed, single-person camera photos.
+Finish the training session before starting a separate **Final test** session.
+The app stores these photos in ignored local folders. The optional **Unenrolled
+final test** set measures false acceptance with consenting people outside the roster.
+The live page can print per-face scores and rejection reasons to the local console.
+
+Run `python scripts/benchmark_recognition.py` from the project folder to compare
+the preprocessing, augmentation, and grouped SVM/PCA configurations. It writes
+the dataset audit, threshold trials, test metrics, and candidate models under
+`reports/recognition_study/`. The study does not replace the active saved models.
+
+Run `python scripts/retrain_augmented.py` for the extended augmentation and
+lower-cutoff experiment. It generates six variants per eligible training crop,
+keeps source photos grouped, and writes a cutoff comparison and staged models to
+`reports/recognition_augmentation/`.
 
 ### E. Run Automated Pytest Test Suite
 ```powershell

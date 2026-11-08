@@ -1,6 +1,7 @@
 """Unified Video and Image Processor with Visual Label Overlay and Temporal Smoothing."""
+import json
 from typing import List, Tuple, Dict, Any, Optional
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 import cv2
 import numpy as np
 
@@ -14,10 +15,11 @@ class TemporalPredictionSmoother:
     """Stabilizes identity predictions across consecutive video frames to prevent label flickering."""
 
     def __init__(self, window_size: int = 5, iou_match_threshold: float = 0.35):
-        self.window_size = window_size
+        self.window_size = max(2, window_size)
         self.iou_match_threshold = iou_match_threshold
         self.track_history = defaultdict(lambda: deque(maxlen=self.window_size))
         self.track_boxes = {}
+        self.track_identities = {}
         self.next_track_id = 0
 
     @staticmethod
@@ -37,39 +39,49 @@ class TemporalPredictionSmoother:
         new_track_boxes = {}
         smoothed_results = []
 
-        for face in detected_faces:
-            box = face["box"]
+        overlaps = []
+        for index, face in enumerate(detected_faces):
+            for track_id, box in self.track_boxes.items():
+                iou = self.compute_iou(face["box"], box)
+                if iou >= self.iou_match_threshold:
+                    overlaps.append((iou, index, track_id))
+
+        assignments = {}
+        used_tracks = set()
+        for _, index, track_id in sorted(overlaps, reverse=True):
+            if index not in assignments and track_id not in used_tracks:
+                assignments[index] = track_id
+                used_tracks.add(track_id)
+
+        for index, face in enumerate(detected_faces):
             raw_id = face["identity"]
-
-            best_iou = 0.0
-            best_tid = None
-            for tid, prev_box in self.track_boxes.items():
-                if tid in new_track_boxes:
-                    continue
-                iou = self.compute_iou(box, prev_box)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_tid = tid
-
-            if best_tid is not None and best_iou >= self.iou_match_threshold:
-                track_id = best_tid
-            else:
+            track_id = assignments.get(index)
+            if track_id is None:
                 track_id = self.next_track_id
                 self.next_track_id += 1
 
-            self.track_history[track_id].append(raw_id)
-            new_track_boxes[track_id] = box
-
-            smoothed_face = dict(face)
             history = self.track_history[track_id]
-            if history.count(raw_id) * 2 <= len(history):
-                smoothed_face["identity"] = "UNKNOWN"
-            smoothed_face["track_id"] = track_id
+            history.append(raw_id)
+            stable_id = self.track_identities.get(track_id, "UNKNOWN")
+            votes = Counter(history)
+            agrees_twice = len(history) >= 2 and history[-2] == raw_id
+            if agrees_twice and votes[raw_id] * 2 > len(history):
+                stable_id = raw_id
+            elif len(history) >= 2 and raw_id != stable_id and history[-2] != stable_id:
+                # Hold a stable name across one outlier, then stop asserting it.
+                stable_id = "UNKNOWN"
+            self.track_identities[track_id] = stable_id
+            new_track_boxes[track_id] = face["box"]
+
+            smoothed_face = dict(face, identity=stable_id, track_id=track_id)
+            if raw_id != stable_id:
+                smoothed_face.update(rec_conf=None, distance=None)
             smoothed_results.append(smoothed_face)
 
         self.track_boxes = new_track_boxes
         for track_id in self.track_history.keys() - new_track_boxes.keys():
             del self.track_history[track_id]
+            del self.track_identities[track_id]
         return smoothed_results
 
 
@@ -79,9 +91,10 @@ class VideoProcessor:
     def __init__(self, detector: Any,
                  recognition_pipeline: RecognitionPipeline,
                  enable_smoothing: bool = True,
-                 smoothing_window: int = 5):
+                 smoothing_window: int = 5, diagnostics: bool = False):
         self.detector = detector
         self.pipeline = recognition_pipeline
+        self.diagnostics = diagnostics
         self.smoother = TemporalPredictionSmoother(window_size=smoothing_window) if enable_smoothing else None
         
         self.frame_count = 0
@@ -110,7 +123,7 @@ class VideoProcessor:
 
             # Build label caption
             if is_unknown:
-                caption = "MOVE INTO FRAME" if f.get("at_frame_edge") else "UNKNOWN"
+                caption = "UNKNOWN - MOVE INTO FRAME" if f.get("at_frame_edge") else "UNKNOWN"
             else:
                 if rec_conf is not None:
                     caption = f"{identity} ({rec_conf:.2f})"
@@ -167,6 +180,7 @@ class VideoProcessor:
         else:
             detections = self.detector.detect_faces(frame)
         faces_recognized = []
+        eligible = []
 
         # 2. Recognize each detected face crop using Eigenfaces
         frame_h, frame_w = frame.shape[:2]
@@ -177,28 +191,55 @@ class VideoProcessor:
             
             aligned_crop = det.get("aligned_crop")
             crop = aligned_crop if aligned_crop is not None else frame[y1:y2, x1:x2]
-            rec_res = {"identity": "UNKNOWN", "confidence": 0.0}
-            can_classify = aligned_crop is not None or alignment != "sface"
-            if can_classify and min(crop.shape[:2]) >= 15:
-                try:
-                    rec_res = self.pipeline.recognize_face(crop)
-                except Exception as e:
-                    logger.error(f"Recognition pipeline error on face crop: {e}")
-
-            faces_recognized.append({
-                "box": (x1, y1, x2, y2),
+            if alignment == "box":
+                crop = frame[top:bottom, left:right]
+            reason = ("alignment unavailable" if alignment == "sface" and aligned_crop is None
+                      else "face crop too small" if min(crop.shape[:2]) < 15 else None)
+            face = {
+                "box": (left, top, right, bottom) if is_video_stream else (x1, y1, x2, y2),
                 "det_conf": det["confidence"],
-                "identity": rec_res["identity"],
-                "rec_conf": rec_res["confidence"],
-                "distance": rec_res.get("distance"),
+                "identity": "UNKNOWN",
+                "rec_conf": 0.0,
+                "distance": None,
                 "crop": crop,
                 "at_frame_edge": at_frame_edge,
                 "source": det.get("source", "detector")
-            })
+            }
+            if self.diagnostics:
+                face["diagnostic"] = {"crop_dimensions": list(crop.shape), "rejection_reason": reason}
+            if reason is None:
+                eligible.append(face)
+            faces_recognized.append(face)
+
+        try:
+            results = (self.pipeline.recognize_faces([f["crop"] for f in eligible], retry_webcam=True)
+                       if is_video_stream else [self.pipeline.recognize_face(f["crop"]) for f in eligible])
+            for face, result in zip(eligible, results, strict=True):
+                face.update(identity=result["identity"], rec_conf=result["confidence"], distance=result.get("distance"))
+                if self.diagnostics:
+                    details = face["diagnostic"]
+                    if self.pipeline.classifier_type == "svm":
+                        details.update(self.pipeline.classifier.prediction_details(result["weights"]))
+                    details.update(raw_prediction=result["identity"], confidence=result["confidence"],
+                                   distance=result.get("distance"),
+                                   rejection_reason="below cutoff" if result["identity"] == "UNKNOWN" else None)
+        except Exception as exc:
+            logger.error(f"Recognition pipeline error: {exc}")
+            for face in eligible:
+                if self.diagnostics:
+                    face["diagnostic"]["rejection_reason"] = "recognition error"
 
         # 3. Apply smoothing ONLY for continuous video streams
         if is_video_stream and self.smoother is not None:
             faces_recognized = self.smoother.smooth(faces_recognized)
+
+        if self.diagnostics:
+            for face in faces_recognized:
+                details = face["diagnostic"]
+                details["displayed_identity"] = face["identity"]
+                if face["identity"] == "UNKNOWN" and details["rejection_reason"] is None:
+                    details["rejection_reason"] = "waiting for consistent frames"
+                logger.info("Face prediction %s", json.dumps(details))
 
         # 4. Draw bounding boxes and labels directly on faces
         annotated = self.draw_face_annotations(frame, faces_recognized)
@@ -211,10 +252,10 @@ class VideoProcessor:
 
         # FPS calculation for live video
         if is_video_stream:
-            self.frame_count += 1
             if self.start_time is None:
                 self.start_time = cv2.getTickCount()
             else:
+                self.frame_count += 1
                 elapsed = (cv2.getTickCount() - self.start_time) / cv2.getTickFrequency()
                 if elapsed > 0.5:
                     self.fps = float(self.frame_count / elapsed)

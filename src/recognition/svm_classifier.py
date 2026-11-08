@@ -86,28 +86,39 @@ class SVMClassifier:
         logger.info(f"Calibrated SVM confidence threshold: {self.confidence_threshold:.3f}")
         return self.confidence_threshold
 
-    def predict_single(self, weight_vector: np.ndarray) -> Tuple[str, float]:
+    def predict_single(self, weight_vector: np.ndarray, *, apply_rejection: bool = True) -> Tuple[str, float]:
         """Predict student identity and class confidence score for a single projection."""
+        return self.predict_batch(np.atleast_2d(weight_vector), apply_rejection=apply_rejection)[0]
+
+    def predict_batch(self, weights: np.ndarray, *, apply_rejection: bool = True) -> List[Tuple[str, float]]:
         if not self.is_trained:
             raise ValueError("Classifier is not trained.")
 
-        X = np.atleast_2d(weight_vector)
-        if self.probability:
-            prob_dist = self.model.predict_proba(X)[0]
-            max_idx = int(np.argmax(prob_dist))
-            confidence = float(prob_dist[max_idx])
-            pred_label = str(self.classes_[max_idx])
+        if not self.probability:
+            return [(str(label), 1.0) for label in self.model.predict(weights)]
+        probs = self.model.predict_proba(weights)
+        best = probs.argmax(axis=1)
+        cutoff = self.confidence_threshold if apply_rejection else None
+        return [(self.UNKNOWN_LABEL if cutoff is not None and row[i] < cutoff else str(self.classes_[i]),
+                 float(row[i])) for row, i in zip(probs, best)]
 
-            if self.confidence_threshold is not None and confidence < self.confidence_threshold:
-                return self.UNKNOWN_LABEL, confidence
-            return pred_label, confidence
-        else:
-            pred = str(self.model.predict(X)[0])
-            return pred, 1.0
+    def prediction_details(self, weights: np.ndarray) -> Dict[str, Any]:
+        """Report calibrated rankings and the separate raw SVM decision scores."""
+        sample = np.atleast_2d(weights)
+        probs = self.model.predict_proba(sample)[0] if self.probability else None
+        top_two = [(str(self.classes_[i]), float(probs[i])) for i in np.argsort(probs)[-2:][::-1]] if probs is not None else []
+        estimator = self.model
+        if hasattr(estimator, "calibrated_classifiers_"):
+            estimator = estimator.calibrated_classifiers_[0].estimator
+        raw = estimator.decision_function(sample).ravel() if hasattr(estimator, "decision_function") else np.empty(0)
+        if len(raw) == 1 and len(self.classes_) == 2:
+            raw = np.array([-raw[0], raw[0]])
+        return {"top_two": top_two, "svm_decision_scores": dict(zip(map(str, self.classes_), map(float, raw))),
+                "cutoff": self.confidence_threshold}
 
     def predict(self, X_weights: np.ndarray) -> List[str]:
         """Predict labels for batch of feature weights."""
-        return [self.predict_single(w)[0] for w in X_weights]
+        return [label for label, _ in self.predict_batch(X_weights)] if len(X_weights) else []
 
     def save(self, filepath: str or Path) -> Path:
         p = Path(filepath)

@@ -93,6 +93,7 @@ def test_suite():
     print("\n[TEST C] Testing webcam feed processor with label overlays...")
     # Run through VideoProcessor on camera frame with temporal smoothing enabled
     webcam_processor = VideoProcessor(detector=detector, recognition_pipeline=pipeline, enable_smoothing=True)
+    webcam_processor.process_frame(raw_b, is_video_stream=True)  # Confirm the first track predictions.
     annotated_cam, cam_meta = webcam_processor.process_frame(raw_b, is_video_stream=True)
     out_c_path = OUTPUT_DIR / "test_c_webcam_frame.jpg"
     cv2.imwrite(str(out_c_path), annotated_cam)
