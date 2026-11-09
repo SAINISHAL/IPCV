@@ -32,6 +32,10 @@ class RecognitionPipeline:
         self.classifier = None
         self.is_ready = False
 
+    @property
+    def face_alignment(self):
+        return self.eigenfaces_model.face_alignment
+
     @classmethod
     def load_pipeline(cls, pca_path: Path, classifier_path: Path,
                       classifier_type: str = "svm",

@@ -11,6 +11,38 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger("FaceAligner")
 
+# Match the 112×112 reference crop used to train the saved Eigenfaces model.
+# Reference: OpenCV modules/objdetect/src/face_recognize.cpp (Apache-2.0).
+_REFERENCE_LANDMARKS = np.float32([
+    [38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366],
+    [41.5493, 92.3655], [70.7299, 92.2041],
+])
+_REFERENCE_CENTER = np.float32([56.0262, 71.9008])
+_CENTERED_REFERENCE = _REFERENCE_LANDMARKS - _REFERENCE_CENTER
+
+
+def align_five_point_crop(image: np.ndarray, landmarks: Optional[np.ndarray]) -> Optional[np.ndarray]:
+    """Fit a rotation, uniform scale and translation to the training landmarks."""
+    if landmarks is None or landmarks.shape != (5, 2) or not np.isfinite(landmarks).all():
+        return None
+
+    points = landmarks.astype(np.float32, copy=False)
+    center = points.mean(axis=0)
+    centered = points - center
+    energy = np.sum(centered * centered, dtype=np.float64)
+    if energy <= np.finfo(np.float32).eps:
+        return None
+
+    # Solve the least-squares similarity transform without reflection.
+    cross = (_CENTERED_REFERENCE[:, :, None] * centered[:, None, :]).sum(axis=0, dtype=np.float64)
+    a = (cross[0, 0] + cross[1, 1]) / energy
+    b = (cross[1, 0] - cross[0, 1]) / energy
+    if np.hypot(a, b) <= np.finfo(np.float32).eps:
+        return None
+    linear = np.array([[a, -b], [b, a]])
+    offset = _REFERENCE_CENTER - linear @ center
+    return cv2.warpAffine(image, np.column_stack((linear, offset)), (112, 112), flags=cv2.INTER_LINEAR)
+
 
 class FaceAligner:
     """Aligns faces using 5 facial landmarks or aspect-ratio preserving square cropping."""

@@ -1,5 +1,6 @@
 """Unified Video and Image Processor with Visual Label Overlay and Temporal Smoothing."""
 import json
+from time import monotonic
 from typing import List, Tuple, Dict, Any, Optional
 from collections import Counter, defaultdict, deque
 import cv2
@@ -14,12 +15,17 @@ logger = setup_logger("VideoProcessor")
 class TemporalPredictionSmoother:
     """Stabilizes identity predictions across consecutive video frames to prevent label flickering."""
 
-    def __init__(self, window_size: int = 5, iou_match_threshold: float = 0.35):
+    def __init__(self, window_size: int = 5, iou_match_threshold: float = 0.35,
+                 unknown_grace_seconds: float = 1.25, missed_grace_seconds: float = 0.50):
         self.window_size = max(2, window_size)
         self.iou_match_threshold = iou_match_threshold
         self.track_history = defaultdict(lambda: deque(maxlen=self.window_size))
         self.track_boxes = {}
         self.track_identities = {}
+        self.confirmed_at = {}
+        self.missing_since = {}
+        self.unknown_grace_seconds = unknown_grace_seconds
+        self.missed_grace_seconds = missed_grace_seconds
         self.next_track_id = 0
 
     @staticmethod
@@ -35,13 +41,16 @@ class TemporalPredictionSmoother:
 
         return interArea / float(boxAArea + boxBArea - interArea)
 
-    def smooth(self, detected_faces: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def smooth(self, detected_faces: List[Dict[str, Any]], *, timestamp: Optional[float] = None) -> List[Dict[str, Any]]:
+        now = monotonic() if timestamp is None else timestamp
         new_track_boxes = {}
         smoothed_results = []
 
         overlaps = []
         for index, face in enumerate(detected_faces):
             for track_id, box in self.track_boxes.items():
+                if track_id in self.missing_since and now - self.missing_since[track_id] > self.missed_grace_seconds:
+                    continue
                 iou = self.compute_iou(face["box"], box)
                 if iou >= self.iou_match_threshold:
                     overlaps.append((iou, index, track_id))
@@ -61,15 +70,27 @@ class TemporalPredictionSmoother:
                 self.next_track_id += 1
 
             history = self.track_history[track_id]
-            history.append(raw_id)
             stable_id = self.track_identities.get(track_id, "UNKNOWN")
+            was_missing = self.missing_since.pop(track_id, None) is not None
+            if was_missing and (raw_id == "UNKNOWN" or raw_id != stable_id):
+                # Require new evidence if the returning face doesn't confirm the previous name.
+                history.clear()
+                stable_id = "UNKNOWN"
+                self.confirmed_at.pop(track_id, None)
+            history.append(raw_id)
             votes = Counter(history)
             agrees_twice = len(history) >= 2 and history[-2] == raw_id
-            if agrees_twice and votes[raw_id] * 2 > len(history):
+            if raw_id == "UNKNOWN":
+                if now - self.confirmed_at.get(track_id, float("-inf")) > self.unknown_grace_seconds:
+                    stable_id = "UNKNOWN"
+            elif agrees_twice and votes[raw_id] * 2 > len(history):
                 stable_id = raw_id
-            elif len(history) >= 2 and raw_id != stable_id and history[-2] != stable_id:
-                # Hold a stable name across one outlier, then stop asserting it.
+            elif raw_id != stable_id and (now - self.confirmed_at.get(track_id, float("-inf")) > self.unknown_grace_seconds
+                                         or (len(history) >= 2 and history[-2] not in {stable_id, "UNKNOWN"})):
+                # A competing name needs repeated agreement and cannot extend the old label.
                 stable_id = "UNKNOWN"
+            if stable_id != "UNKNOWN" and raw_id == stable_id:
+                self.confirmed_at[track_id] = now
             self.track_identities[track_id] = stable_id
             new_track_boxes[track_id] = face["box"]
 
@@ -78,10 +99,16 @@ class TemporalPredictionSmoother:
                 smoothed_face.update(rec_conf=None, distance=None)
             smoothed_results.append(smoothed_face)
 
+        for track_id in self.track_boxes.keys() - new_track_boxes.keys():
+            missing = self.missing_since.setdefault(track_id, now)
+            if now - missing <= self.missed_grace_seconds:
+                new_track_boxes[track_id] = self.track_boxes[track_id]
+            else:
+                del self.track_history[track_id]
+                del self.track_identities[track_id]
+                self.confirmed_at.pop(track_id, None)
+                del self.missing_since[track_id]
         self.track_boxes = new_track_boxes
-        for track_id in self.track_history.keys() - new_track_boxes.keys():
-            del self.track_history[track_id]
-            del self.track_identities[track_id]
         return smoothed_results
 
 
@@ -100,6 +127,30 @@ class VideoProcessor:
         self.frame_count = 0
         self.start_time = None
         self.fps = 0.0
+
+    def _recognize_photo_faces(self, frame: np.ndarray, faces: list[dict]) -> list[dict]:
+        original = [self.pipeline.recognize_face(face["crop"]) for face in faces]
+        refine = getattr(self.detector, "align_photo_face", None)
+        if refine is None or self.pipeline.face_alignment != "sface" or self.pipeline.classifier_type != "svm":
+            return original
+
+        crops = [refine(frame, face["box"]) for face in faces]
+        candidates = [self.pipeline.recognize_face(crop) if crop is not None else prior
+                      for crop, prior in zip(crops, original)]
+        counts = Counter(candidate["identity"] for candidate in candidates)
+        original_names = {prior["identity"] for prior in original}
+
+        results = []
+        for face, crop, prior, candidate in zip(faces, crops, original, candidates):
+            name = candidate["identity"]
+            # A refinement must not introduce a duplicate name into a group photo.
+            if name != "UNKNOWN" and name != prior["identity"] and (counts[name] > 1 or name in original_names):
+                results.append(prior)
+                continue
+            if crop is not None:
+                face["crop"] = crop
+            results.append(candidate)
+        return results
 
     def draw_face_annotations(self, image: np.ndarray, faces: List[Dict[str, Any]]) -> np.ndarray:
         """Draw high-contrast, professional visual bounding boxes and name labels directly on image."""
@@ -174,7 +225,7 @@ class VideoProcessor:
             return frame, {"detected": 0, "recognized": 0, "unknown": 0, "fps": 0.0, "faces": []}
 
         # 1. Detect faces using Unified Detector
-        alignment = self.pipeline.eigenfaces_model.face_alignment
+        alignment = self.pipeline.face_alignment
         if alignment == "sface":
             detections = self.detector.detect_faces(frame, alignment=alignment)
         else:
@@ -196,7 +247,7 @@ class VideoProcessor:
             reason = ("alignment unavailable" if alignment == "sface" and aligned_crop is None
                       else "face crop too small" if min(crop.shape[:2]) < 15 else None)
             face = {
-                "box": (left, top, right, bottom) if is_video_stream else (x1, y1, x2, y2),
+                "box": (left, top, right, bottom),
                 "det_conf": det["confidence"],
                 "identity": "UNKNOWN",
                 "rec_conf": 0.0,
@@ -213,16 +264,18 @@ class VideoProcessor:
 
         try:
             results = (self.pipeline.recognize_faces([f["crop"] for f in eligible], retry_webcam=True)
-                       if is_video_stream else [self.pipeline.recognize_face(f["crop"]) for f in eligible])
+                       if is_video_stream else self._recognize_photo_faces(frame, eligible))
             for face, result in zip(eligible, results, strict=True):
                 face.update(identity=result["identity"], rec_conf=result["confidence"], distance=result.get("distance"))
                 if self.diagnostics:
                     details = face["diagnostic"]
                     if self.pipeline.classifier_type == "svm":
                         details.update(self.pipeline.classifier.prediction_details(result["weights"]))
+                    details.update(result.get("diagnostic", {}))
                     details.update(raw_prediction=result["identity"], confidence=result["confidence"],
                                    distance=result.get("distance"),
-                                   rejection_reason="below cutoff" if result["identity"] == "UNKNOWN" else None)
+                                   rejection_reason=details.get("rejection_reason") or
+                                   ("below cutoff" if result["identity"] == "UNKNOWN" else None))
         except Exception as exc:
             logger.error(f"Recognition pipeline error: {exc}")
             for face in eligible:

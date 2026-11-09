@@ -76,7 +76,8 @@ def study(out):
     detector = UnifiedFaceDetector(engine="yunet")
     parts, flags, groups, fingerprints = load_classroom(ROOT, detector)
     original_rows = [row for rows in parts.values() for row in rows]
-    audit_identities(original_rows, detector.sface_aligner, flags)
+    audit_model = cv2.FaceRecognizerSF.create(str(ROOT / "models/pretrained/sface.onnx"), "")
+    audit_identities(original_rows, audit_model, flags)
     log(f"Audit: {len(groups)} source photos in {len(set(groups.values()))} independent groups; "
         f"flags {dict((key, len(items)) for key, items in flags.items())}")
     parts = select_study_rows(parts, flags)

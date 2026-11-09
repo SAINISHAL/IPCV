@@ -168,31 +168,16 @@ python scripts/run_webcam.py --device 1
 ```
 *Press `q` or `ESC` in the OpenCV camera window to terminate.*
 
-### D. Interactive Streamlit Web Dashboard
+### D. Photo Upload Dashboard
 ```powershell
 python -m streamlit run app/app.py
 ```
 
-Open **Live Webcam Recognition**, select the camera device, and press **Start
-Camera**. Device `0` is typically the built-in webcam and additional devices
-can use `1`, `2`, and higher indices. The dashboard uses the camera connected to
-the computer running Streamlit. It displays the live feed, per-face recognition
-status, and the measured rate of processed frames. Press **Stop Camera** or leave
-the page to release the webcam. If the device fails to open, check system camera
-permissions and close other apps using it. Use **Uploaded Image Recognition**
-for saved photos.
+Upload one or more portraits or group photos to see the recognized names and
+face counts below each labeled photo. YOLOv8-Face and YuNet locate faces, and the
+saved **Eigenfaces + SVM** model identifies them.
 
-The live feed defaults to the pretrained YuNet detector for faster processing.
-Choose **Full ensemble** before starting if you need the extra YOLOv8-Face pass
-for small or distant faces. Both modes use the same saved PCA and SVM model.
-
-### Guided capture and recognition study
-
-Open **Guided Webcam Capture** to save confirmed, single-person camera photos.
-Finish the training session before starting a separate **Final test** session.
-The app stores these photos in ignored local folders. The optional **Unenrolled
-final test** set measures false acceptance with consenting people outside the roster.
-The live page can print per-face scores and rejection reasons to the local console.
+### Offline recognition studies
 
 Run `python scripts/benchmark_recognition.py` from the project folder to compare
 the preprocessing, augmentation, and grouped SVM/PCA configurations. It writes

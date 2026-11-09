@@ -11,9 +11,11 @@ import cv2
 import numpy as np
 
 from src.utils.logger import setup_logger
-from src.detection.face_aligner import FaceAligner
+from src.detection.face_aligner import FaceAligner, align_five_point_crop
 
 logger = setup_logger("UnifiedFaceDetector")
+YUNET_IMAGE_LIMIT = 1600
+YUNET_GRID_SIZE = 32
 
 
 class UnifiedFaceDetector:
@@ -33,7 +35,6 @@ class UnifiedFaceDetector:
         self.project_root = Path(__file__).resolve().parent.parent.parent
 
         self.aligner = FaceAligner(desired_face_size=(100, 100)) if align_faces else None
-        self.sface_aligner = None
 
         # 1. Initialize YOLOv8-Face Model
         self.yolo_face = None
@@ -107,7 +108,7 @@ class UnifiedFaceDetector:
             min_face_size: (min_w, min_h) in original pixels
             margin_ratio: Margin to expand around detected bounding box
             debug: If True, returns (detections, debug_info_dict)
-            alignment: Use "sface" for models trained on OpenCV's 112x112 five-point crops.
+            alignment: Saved models use "sface" to refer to the 112x112 five-point crop geometry.
             
         Returns:
             List of detection dicts (or tuple of (list, debug_info) if debug=True):
@@ -162,8 +163,8 @@ class UnifiedFaceDetector:
                 self.yunet_detector.setNMSThreshold(self.nms_thresh)
 
                 # Letterbox image for optimal YuNet receptive field if very large
-                if max(h, w) > 1600:
-                    target_sz = 1600
+                if max(h, w) > YUNET_IMAGE_LIMIT:
+                    target_sz = YUNET_IMAGE_LIMIT
                     padded_img, scale, dw, dh = self.letterbox_image(image, target_size=target_sz)
                     self.yunet_detector.setInputSize((target_sz, target_sz))
                     _, faces = self.yunet_detector.detect(padded_img)
@@ -261,17 +262,7 @@ class UnifiedFaceDetector:
             # Aligned face crop for Eigenfaces
             aligned_crop = None
             if alignment == "sface":
-                if landmarks is not None and landmarks.shape == (5, 2) and np.isfinite(landmarks).all():
-                    if self.sface_aligner is None:
-                        model_path = self.project_root / "models" / "pretrained" / "sface.onnx"
-                        self.sface_aligner = cv2.FaceRecognizerSF.create(str(model_path), "")
-                    face_row = np.asarray(
-                        [x1, y1, bw, bh, *landmarks.ravel(), det["confidence"]], dtype=np.float32
-                    )
-                    try:
-                        aligned_crop = self.sface_aligner.alignCrop(image, face_row)
-                    except cv2.error as e:
-                        logger.warning(f"Could not align detected face: {e}")
+                aligned_crop = align_five_point_crop(image, landmarks)
             elif self.aligner is not None:
                 aligned_crop = self.aligner.align_face(image, (x1, y1, x2, y2), landmarks=landmarks)
             else:
@@ -303,7 +294,15 @@ class UnifiedFaceDetector:
 
         return final_detections
 
-    def query_face_landmarks(self, image: np.ndarray, box: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+    def align_photo_face(self, image: np.ndarray, box: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+        """Align a large photo's face using landmarks at the original pixel resolution."""
+        if self.yunet_detector is None or max(image.shape[:2]) <= YUNET_IMAGE_LIMIT:
+            return None
+        landmarks = self.query_face_landmarks(image, box, preserve_grid=True)
+        return align_five_point_crop(image, landmarks)
+
+    def query_face_landmarks(self, image: np.ndarray, box: Tuple[int, int, int, int], *,
+                             preserve_grid: bool = False) -> Optional[np.ndarray]:
         """Crop face region with margin and run fast YuNet landmark detection."""
         try:
             h, w = image.shape[:2]
@@ -312,8 +311,17 @@ class UnifiedFaceDetector:
             bh = y2 - y1
             pad = int(max(bw, bh) * 0.3)
 
-            cx1, cy1 = max(0, x1 - pad), max(0, y1 - pad)
-            cx2, cy2 = min(w, x2 + pad), min(h, y2 + pad)
+            if preserve_grid:
+                # Keep YuNet's sampling grid aligned to the original image and leave context around the face.
+                pad = max(3 * YUNET_GRID_SIZE, round(max(bw, bh) * 0.3))
+            cx1, cy1, cx2, cy2 = x1 - pad, y1 - pad, x2 + pad, y2 + pad
+            if preserve_grid:
+                grid = YUNET_GRID_SIZE
+                cx1, cy1 = cx1 // grid * grid, cy1 // grid * grid
+                cx2, cy2 = (cx2 + grid - 1) // grid * grid, (cy2 + grid - 1) // grid * grid
+            cx1, cy1, cx2, cy2 = max(0, cx1), max(0, cy1), min(w, cx2), min(h, cy2)
+            if preserve_grid and max(cx2 - cx1, cy2 - cy1) > YUNET_IMAGE_LIMIT:
+                return None
             crop = image[cy1:cy2, cx1:cx2]
 
             if crop.size == 0 or crop.shape[0] < 20 or crop.shape[1] < 20:
@@ -336,7 +344,8 @@ class UnifiedFaceDetector:
                     return intersection / (bw * bh + fw * fh - intersection)
 
                 best_face = max(faces, key=box_iou)
-                if len(best_face) >= 14 and box_iou(best_face) >= 0.3:
+                min_overlap = 0.5 if preserve_grid else 0.3
+                if len(best_face) >= 14 and box_iou(best_face) >= min_overlap:
                     lm = best_face[4:14].reshape((5, 2))
                     # Map back to full image
                     lm[:, 0] += cx1
